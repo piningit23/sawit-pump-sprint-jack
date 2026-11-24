@@ -1,14 +1,14 @@
 // sawit-pump-sprint-jack — launch sniper for agent-fun/replay/v2 (pump.fun).
 //
-// What the dev window taught us (grid-searched on the kit's simulator, then
-// verified with grade-local): most fresh launches are noise and lose money,
-// but the few that already hold >= 3 SOL of real buying within their first
-// 3 slots, from at least 3 distinct non-creator wallets, keep running often
-// enough to pay. So we buy only those, take profit fast at +20%, cut at -8%,
-// never hold past 30 slots, and exit at once if the creator sells while we
-// hold. One add: a second tranche, on a later batch, once the price has
-// moved above our first buy — the per-reply size cap (1% of real SOL) makes
-// a single buy small, so the add is how a winner gets real size.
+// What the dev window taught us (grid-searched on the kit's simulator over
+// the FULL window, then verified with grade-local): most fresh launches are
+// noise and lose money, but the few that already hold >= 3 SOL of real buying
+// within their first 3 slots, from at least 3 distinct non-creator wallets,
+// lose the least and roughly break even in the window's first half. So we buy
+// only those, with a small 0.05 SOL stake (the per-reply cap of 1% of real
+// SOL binds first anyway), take profit fast at +20%, cut at -8%, never hold
+// past 30 slots, and exit at once if the creator sells while we hold. One
+// buy per coin, no adds: on the full window the add only added losses.
 //
 // Pure function of the batches: no clock, no randomness, no I/O, no network.
 // Deterministic across runs, so the two replay executions agree.
@@ -16,8 +16,7 @@
 import { BPS, runBot, type Batch, type BotState, type BuyInput, type OrderInput, type Pubkey, type SellInput } from './vendor/makefun-bot.ts';
 
 // ---- tunables (lamports unless noted) ---------------------------------------
-const STAKE_LAMPORTS = 200_000_000n; // 0.20 SOL aimed per coin (per-reply cap binds first)
-const ADD_LAMPORTS = 200_000_000n; // 0.20 SOL for the one add (also cap-bound)
+const STAKE_LAMPORTS = 50_000_000n; // 0.05 SOL per coin (per-reply cap binds first)
 const MIN_BUY_LAMPORTS = 5_000_000n; // 0.005 SOL: smaller buys are not worth the tx fee
 const MAX_AGE_SLOTS = 3; // first buy must be decided within 3 slots of creation
 const MIN_REAL_SOL = 3_000_000_000n; // 3 SOL of real SOL in the curve at entry
@@ -27,7 +26,6 @@ const MIN_EARLY_BUYERS = 3; // distinct non-creator buyers seen before entry
 const MAX_EARLY_BUYERS = 3; // more than this in 3 slots smells like a bundled launch
 const FLOW_WINDOW_SLOTS = 10;
 const MIN_FLOW_LAMPORTS = 0n; // net flow over the window must not be negative
-const ADD_DELAY_SLOTS = 2; // the add waits at least 2 slots after the first buy
 const TP_BPS = 2_000; // +20%: exit everything
 const SL_BPS = 800; // -8%: exit everything
 const MAX_HOLD_SLOTS = 30;
@@ -46,20 +44,14 @@ interface Coin {
   mint: Pubkey;
   createSlot: number;
   creator: Pubkey;
-  vq0: bigint;
-  vt0: bigint;
   devBuy: bigint;
   trades: number;
   buyers: Set<Pubkey>;
   bought: bigint;
   soldByOthers: bigint;
   devSold: boolean;
-  lastTradeSlot: number;
   recent: Tick[];
-  buysSent: number;
-  lastBuyVq: bigint;
-  lastBuyVt: bigint;
-  lastBuySlot: number;
+  boughtOnce: boolean;
   done: boolean;
 }
 
@@ -98,20 +90,14 @@ function readEvents(batch: Batch): void {
         mint: e.mint,
         createSlot: e.slot,
         creator: e.creator,
-        vq0: BigInt(e.virtual_quote_reserves),
-        vt0: BigInt(e.virtual_token_reserves),
         devBuy: 0n,
         trades: 0,
         buyers: new Set(),
         bought: 0n,
         soldByOthers: 0n,
         devSold: false,
-        lastTradeSlot: e.slot,
         recent: [],
-        buysSent: 0,
-        lastBuyVq: 0n,
-        lastBuyVt: 1n,
-        lastBuySlot: 0,
+        boughtOnce: false,
         done: false,
       });
     } else if (e.event === 'TradeEvent') {
@@ -120,7 +106,6 @@ function readEvents(batch: Batch): void {
       const sol = BigInt(e.sol_amount);
       const isDev = e.user === c.creator;
       c.trades += 1;
-      c.lastTradeSlot = e.slot;
       c.recent.push({ slot: e.slot, isBuy: e.is_buy, sol, user: e.user });
       if (e.is_buy) {
         c.bought += sol;
@@ -200,46 +185,20 @@ await runBot({
       if (c !== undefined) c.done = true;
     }
 
-    // ---- entries and the one add --------------------------------------------
+    // ---- entries: fresh launches that pass the filter -----------------------
     let free = state.freeCashLamports() - tx * BigInt(orders.length);
     let open = state.committedPositionCount();
     for (const c of coins.values()) {
       if (orders.length >= cap) break;
-      if (c.done) continue;
-      const curve = state.curves.get(c.mint);
-      if (curve === undefined || curve.complete) continue;
-      const vq = curve.virtual_quote_reserves;
-      const vt = curve.virtual_token_reserves;
-
-      if (c.buysSent > 0) {
-        // The add: once, on a later batch, only while the price sits above
-        // our first buy's decision price and the flow is still non-negative.
-        if (c.buysSent > 1) continue;
-        if (!state.positions.has(c.mint) || selling.has(c.mint) || hasPending(state, c.mint, 'buy')) continue;
-        if (c.devSold) continue;
-        if (state.slot - c.lastBuySlot < ADD_DELAY_SLOTS) continue;
-        if (vq * c.lastBuyVt < c.lastBuyVq * vt) continue;
-        if (flowNet(c, state.slot) < MIN_FLOW_LAMPORTS) continue;
-        const maxAdd = state.maxBuyLamports(c.mint);
-        const amount = ADD_LAMPORTS < maxAdd ? ADD_LAMPORTS : maxAdd;
-        if (amount < MIN_BUY_LAMPORTS) continue;
-        if (free < amount + tx) continue;
-        orders.push({ side: 'buy', mint: c.mint, quote_lamports: amount, max_slippage_bps: WIDE_SLIPPAGE } satisfies BuyInput);
-        free -= amount + tx;
-        c.buysSent += 1;
-        c.lastBuyVq = vq;
-        c.lastBuyVt = vt;
-        c.lastBuySlot = state.slot;
-        continue;
-      }
-
-      // First buy: fresh launch that passes the filter.
+      if (c.done || c.boughtOnce) continue;
       const age = state.slot - c.createSlot;
       if (age > MAX_AGE_SLOTS) {
         c.done = true;
         continue;
       }
       if (open >= state.hello.caps.max_open_positions) continue;
+      const curve = state.curves.get(c.mint);
+      if (curve === undefined || curve.complete) continue;
       if (c.devSold) {
         c.done = true;
         continue;
@@ -257,10 +216,7 @@ await runBot({
       if (free < amount + tx) continue;
       orders.push({ side: 'buy', mint: c.mint, quote_lamports: amount, max_slippage_bps: WIDE_SLIPPAGE } satisfies BuyInput);
       free -= amount + tx;
-      c.buysSent += 1;
-      c.lastBuyVq = vq;
-      c.lastBuyVt = vt;
-      c.lastBuySlot = state.slot;
+      c.boughtOnce = true;
       open += 1;
     }
     return orders;
